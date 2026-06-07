@@ -20,6 +20,9 @@ from OpenSSL.SSL import VERIFY_FAIL_IF_NO_PEER_CERT, VERIFY_PEER, Connection
 
 import attr
 from constantly import FlagConstant, Flags, NamedConstant, Names
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.x509.oid import NameOID
 from incremental import Version
 
 from twisted.internet.abstract import isIPAddress, isIPv6Address
@@ -170,6 +173,48 @@ _x509names = {
 }
 
 
+# Mapping between the extended X.509 name fields supported by
+# L{DistinguishedName} and the object identifiers used by the
+# C{cryptography} library to represent them.
+_nameToOID = {
+    "commonName": NameOID.COMMON_NAME,
+    "organizationName": NameOID.ORGANIZATION_NAME,
+    "organizationalUnitName": NameOID.ORGANIZATIONAL_UNIT_NAME,
+    "localityName": NameOID.LOCALITY_NAME,
+    "stateOrProvinceName": NameOID.STATE_OR_PROVINCE_NAME,
+    "countryName": NameOID.COUNTRY_NAME,
+    "emailAddress": NameOID.EMAIL_ADDRESS,
+}
+_oidToName = {oid: name for name, oid in _nameToOID.items()}
+
+
+# Mapping between the digest algorithm names accepted by the public API and
+# the corresponding C{cryptography} hash algorithm classes.
+_digestAlgorithms = {
+    "md5": hashes.MD5,
+    "sha1": hashes.SHA1,
+    "sha224": hashes.SHA224,
+    "sha256": hashes.SHA256,
+    "sha384": hashes.SHA384,
+    "sha512": hashes.SHA512,
+}
+
+
+def _hashFromName(name: str) -> hashes.HashAlgorithm:
+    """
+    Return a C{cryptography} hash algorithm instance for the given name.
+
+    @param name: The name of a digest algorithm, e.g. C{"sha256"}.
+    @type name: L{str}
+
+    @rtype: L{cryptography.hazmat.primitives.hashes.HashAlgorithm}
+    """
+    try:
+        return _digestAlgorithms[name.lower()]()
+    except KeyError:
+        raise ValueError(f"Unknown digest algorithm {name!r}")
+
+
 class DistinguishedName(dict[str, bytes]):
     """
     Identify and describe an entity.
@@ -228,6 +273,33 @@ class DistinguishedName(dict[str, bytes]):
     def _copyInto(self, x509name):
         for k, v in self.items():
             setattr(x509name, k, nativeString(v))
+
+    def _toX509Name(self):
+        """
+        Convert this L{DistinguishedName} into a L{cryptography.x509.Name}.
+
+        @rtype: L{cryptography.x509.Name}
+        """
+        return x509.Name(
+            [
+                x509.NameAttribute(_nameToOID[k], nativeString(v))
+                for k, v in self.items()
+                if k in _nameToOID
+            ]
+        )
+
+    def _copyFromX509Name(self, name):
+        """
+        Copy the recognized fields of a L{cryptography.x509.Name} into this
+        L{DistinguishedName}.
+
+        @param name: The name to copy from.
+        @type name: L{cryptography.x509.Name}
+        """
+        for attribute in name:
+            fieldName = _oidToName.get(attribute.oid)
+            if fieldName is not None:
+                setattr(self, fieldName, attribute.value)
 
     def __repr__(self) -> str:
         return "<DN %s>" % (dict.__repr__(self)[1:-1])
@@ -490,19 +562,40 @@ class CertificateRequest(CertBase):
 
     Certificate requests are given to certificate authorities to be signed and
     returned resulting in an actual certificate.
+
+    @ivar original: The underlying certificate signing request object.
+    @type original: L{cryptography.x509.CertificateSigningRequest}
     """
 
     @classmethod
     def load(Class, requestData, requestFormat=crypto.FILETYPE_ASN1):
-        req = crypto.load_certificate_request(requestFormat, requestData)
+        if requestFormat == crypto.FILETYPE_PEM:
+            req = x509.load_pem_x509_csr(requestData)
+        else:
+            req = x509.load_der_x509_csr(requestData)
         dn = DistinguishedName()
-        dn._copyFrom(req.get_subject())
-        if not req.verify(req.get_pubkey()):
+        dn._copyFromX509Name(req.subject)
+        if not req.is_signature_valid:
             raise VerifyError(f"Can't verify that request for {dn!r} is self-signed.")
         return Class(req)
 
+    def getSubject(self):
+        """
+        Retrieve the subject of this certificate request.
+
+        @return: A copy of the subject of this certificate request.
+        @rtype: L{DistinguishedName}
+        """
+        dn = DistinguishedName()
+        dn._copyFromX509Name(self.original.subject)
+        return dn
+
     def dump(self, format=crypto.FILETYPE_ASN1):
-        return crypto.dump_certificate_request(format, self.original)
+        if format == crypto.FILETYPE_PEM:
+            encoding = serialization.Encoding.PEM
+        else:
+            encoding = serialization.Encoding.DER
+        return self.original.public_bytes(encoding)
 
 
 class PrivateCertificate(Certificate):
@@ -714,10 +807,11 @@ class KeyPair(PublicKey):
         return PrivateCertificate.load(newCertData, self, format)
 
     def requestObject(self, distinguishedName, digestAlgorithm="sha256"):
-        req = crypto.X509Req()
-        req.set_pubkey(self.original)
-        distinguishedName._copyInto(req.get_subject())
-        req.sign(self.original, digestAlgorithm)
+        req = (
+            x509.CertificateSigningRequestBuilder()
+            .subject_name(distinguishedName._toX509Name())
+            .sign(self.original.to_cryptography_key(), _hashFromName(digestAlgorithm))
+        )
         return CertificateRequest(req)
 
     def certificateRequest(
@@ -787,8 +881,10 @@ class KeyPair(PublicKey):
         req = requestObject.original
         cert = crypto.X509()
         issuerDistinguishedName._copyInto(cert.get_issuer())
-        cert.set_subject(req.get_subject())
-        cert.set_pubkey(req.get_pubkey())
+        subjectName = DistinguishedName()
+        subjectName._copyFromX509Name(req.subject)
+        subjectName._copyInto(cert.get_subject())
+        cert.set_pubkey(crypto.PKey.from_cryptography_key(req.public_key()))
         cert.gmtime_adj_notBefore(0)
         cert.gmtime_adj_notAfter(secondsToExpiry)
         cert.set_serial_number(serialNumber)
