@@ -46,7 +46,7 @@ if requireModule("OpenSSL"):
     import ipaddress
 
     from OpenSSL import SSL
-    from OpenSSL.crypto import FILETYPE_PEM, TYPE_RSA, X509, PKey, get_elliptic_curves
+    from OpenSSL.crypto import FILETYPE_PEM, X509, PKey, get_elliptic_curves
 
     from cryptography import x509
     from cryptography.hazmat.backends import default_backend
@@ -125,29 +125,46 @@ A_PEER_CERTIFICATE_PEM = """
 A_KEYPAIR = getModule(__name__).filePath.sibling("server.pem").getContent()
 
 
-def counter(counter=itertools.count()):
+def counter(counter=itertools.count(1)):
     """
-    Each time we're called, return the next integer in the natural numbers.
+    Each time we're called, return the next positive integer.  Serial numbers
+    start at 1 because cryptography rejects a zero serial number.
     """
     return next(counter)
 
 
 def makeCertificate(**kw):
-    keypair = PKey()
-    keypair.generate_key(TYPE_RSA, 2048)
+    keypair = generate_private_key(public_exponent=65537, key_size=2048)
+    nameOIDs = {
+        "CN": NameOID.COMMON_NAME,
+        "O": NameOID.ORGANIZATION_NAME,
+        "OU": NameOID.ORGANIZATIONAL_UNIT_NAME,
+        "C": NameOID.COUNTRY_NAME,
+        "ST": NameOID.STATE_OR_PROVINCE_NAME,
+        "L": NameOID.LOCALITY_NAME,
+        "emailAddress": NameOID.EMAIL_ADDRESS,
+    }
+    name = x509.Name(
+        [x509.NameAttribute(nameOIDs[k], nativeString(v)) for k, v in kw.items()]
+    )
 
-    certificate = X509()
-    certificate.gmtime_adj_notBefore(0)
-    certificate.gmtime_adj_notAfter(60 * 60 * 24 * 365)  # One year
-    for xname in certificate.get_issuer(), certificate.get_subject():
-        for k, v in kw.items():
-            setattr(xname, k, nativeString(v))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .issuer_name(name)
+        .subject_name(name)
+        .public_key(keypair.public_key())
+        .serial_number(counter())
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=365))  # One year
+        # crypto.X509() historically produced v1 certificates, which OpenSSL
+        # treats as CA-capable; several of these certs are used as CAs, so the
+        # equivalent capability must be set explicitly on a v3 certificate.
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(keypair, hashes.SHA256())
+    )
 
-    certificate.set_serial_number(counter())
-    certificate.set_pubkey(keypair)
-    certificate.sign(keypair, "md5")
-
-    return keypair, certificate
+    return PKey.from_cryptography_key(keypair), X509.from_cryptography(certificate)
 
 
 oneDay = datetime.timedelta(1, 0, 0)
