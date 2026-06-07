@@ -4,6 +4,7 @@
 # See LICENSE for details.
 from __future__ import annotations
 
+import datetime
 import warnings
 from binascii import hexlify
 from collections.abc import Sequence
@@ -22,6 +23,7 @@ import attr
 from constantly import FlagConstant, Flags, NamedConstant, Names
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import dsa, rsa
 from cryptography.x509.oid import NameOID
 from incremental import Version
 
@@ -189,10 +191,10 @@ _oidToName = {oid: name for name, oid in _nameToOID.items()}
 
 
 # Mapping between the digest algorithm names accepted by the public API and
-# the corresponding C{cryptography} hash algorithm classes.
+# the corresponding C{cryptography} hash algorithm classes.  MD5 and SHA-1 are
+# intentionally omitted: C{cryptography} refuses to produce signatures with
+# them, so they could never work here.
 _digestAlgorithms = {
-    "md5": hashes.MD5,
-    "sha1": hashes.SHA1,
     "sha224": hashes.SHA224,
     "sha256": hashes.SHA256,
     "sha384": hashes.SHA384,
@@ -799,9 +801,13 @@ class KeyPair(PublicKey):
 
     @classmethod
     def generate(Class, kind=crypto.TYPE_RSA, size=2048):
-        pkey = crypto.PKey()
-        pkey.generate_key(kind, size)
-        return Class(pkey)
+        if kind == crypto.TYPE_RSA:
+            key = rsa.generate_private_key(public_exponent=65537, key_size=size)
+        elif kind == crypto.TYPE_DSA:
+            key = dsa.generate_private_key(key_size=size)
+        else:
+            raise ValueError(f"Unsupported key type {kind!r}")
+        return Class(crypto.PKey.from_cryptography_key(key))
 
     def newCertificate(self, newCertData, format=crypto.FILETYPE_ASN1):
         return PrivateCertificate.load(newCertData, self, format)
@@ -879,17 +885,25 @@ class KeyPair(PublicKey):
         Sign a CertificateRequest instance, returning a Certificate instance.
         """
         req = requestObject.original
-        cert = crypto.X509()
-        issuerDistinguishedName._copyInto(cert.get_issuer())
-        subjectName = DistinguishedName()
-        subjectName._copyFromX509Name(req.subject)
-        subjectName._copyInto(cert.get_subject())
-        cert.set_pubkey(crypto.PKey.from_cryptography_key(req.public_key()))
-        cert.gmtime_adj_notBefore(0)
-        cert.gmtime_adj_notAfter(secondsToExpiry)
-        cert.set_serial_number(serialNumber)
-        cert.sign(self.original, digestAlgorithm)
-        return Certificate(cert)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .issuer_name(issuerDistinguishedName._toX509Name())
+            .subject_name(req.subject)
+            .public_key(req.public_key())
+            .serial_number(serialNumber)
+            .not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(seconds=secondsToExpiry))
+            # The certificates this historically produced were X.509 v1, which
+            # OpenSSL treats as CA-capable.  cryptography emits v3 certificates,
+            # where that capability must be expressed explicitly to preserve the
+            # ability to sign further certificates.
+            .add_extension(
+                x509.BasicConstraints(ca=True, path_length=None), critical=True
+            )
+            .sign(self.original.to_cryptography_key(), _hashFromName(digestAlgorithm))
+        )
+        return Certificate(crypto.X509.from_cryptography(cert))
 
     def selfSignedCert(self, serialNumber, **kw):
         dn = DN(**kw)
